@@ -75,8 +75,9 @@ var g_balance_def = []*Balance{
 
 func main() {
 	c := readConfig()
-	fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0666)
+	fp, err := os.OpenFile(c.LogFilePath, os.O_APPEND | os.O_CREATE, 0666)
 	if err != nil { log.Fatal("file open error") }
+	defer fp.Close()
 	logger := log.New(fp, "access", log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	myHandler := &SammaryHandle{
