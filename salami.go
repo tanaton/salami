@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -62,7 +63,7 @@ const (
 	PORT_DEF						= 18080
 	READ_TIMEOUT_SEC_DEF			= 10
 	WRITE_TIMEOUT_SEC_DEF			= 10
-	LOG_FILE_PATH_DEF				= "salami.log"
+	LOG_FILE_PATH_DEF				= ""
 	MAX_HEADER_BYTES_DEF			= 1024 * 1024
 )
 
@@ -75,10 +76,16 @@ var g_balance_def = []*Balance{
 
 func main() {
 	c := readConfig()
-	fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0666)
-	if err != nil { log.Fatal("file open error") }
-	defer fp.Close()
-	logger := log.New(fp, "access", log.Ldate | log.Ltime | log.Lmicroseconds)
+	var w io.Writer
+	if c.LogFilePath == "" {
+		w = os.Stdout
+	} else {
+		fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0666)
+		if err != nil { log.Fatal("file open error") }
+		defer fp.Close()
+		w = fp
+	}
+	logger := log.New(w, "", log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	myHandler := &SammaryHandle{
 		conf	: c,
