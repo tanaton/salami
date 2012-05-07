@@ -57,8 +57,8 @@ const (
 	INTVAL_CONF_ERR					= 0x80000000
 	LOAD_BALANCE_BUF				= 32
 	CONFIG_JSON_PATH_DEF			= "salami.config.json"
+	ERROR_STATUS_CODE_DEF			= 400
 
-	PARALLEL						= 6
 	ADDR_DEF						= ""
 	PORT_DEF						= 18080
 	READ_TIMEOUT_SEC_DEF			= 10
@@ -122,7 +122,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pl, err := createPathList(r.URL)
 	if err != nil {
 		// 異常
-		w.WriteHeader(400)
+		w.WriteHeader(ERROR_STATUS_CODE_DEF)
 		sh.logger.Print("Path error")
 		return
 	}
@@ -130,7 +130,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ホワイトリストの確認
 	if sh.conf.URLWhiteList != nil && !sh.checkUrlWhiteList(u) {
-		w.WriteHeader(400)
+		w.WriteHeader(ERROR_STATUS_CODE_DEF)
 		sh.logger.Print("WhiteList error")
 		return
 	}
@@ -154,15 +154,8 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer se.mproc.Unlock()
 
 		sh.mapAdd(u, se)
-		var sl []string
 		lbhost := <-sh.lb
-		if lbhost.Host != "" {
-			sl = make([]string, 0, 1)
-			sl = append(sl, lbhost.Host)
-			sl = append(sl, pl...)
-		} else {
-			sl = pl
-		}
+		sl := updatePathList(lbhost.Host, pl)
 		data, res, err := httpDownload(sl, lbhost.Port, r, TIMEOUT_NSEC)
 		sh.mapDelete(u)
 
@@ -256,7 +249,7 @@ func (se *Session) transferBad() {
 		sync <- true
 		go func(w http.ResponseWriter) {
 			// ヘッダーを書き込む
-			w.WriteHeader(400)
+			w.WriteHeader(ERROR_STATUS_CODE_DEF)
 			<-sync
 		}(resw)
 	}
@@ -301,6 +294,17 @@ func createPathList(u *url.URL) (pl []string, err error) {
 	pl = strings.Split(strings.TrimLeft(u.Path, "/"), "/")
 	if len(pl) < 2 {
 		err = errors.New("Invalid request")
+	}
+	return
+}
+
+func updatePathList(host string, pl []string) (sl []string) {
+	if host != "" {
+		sl = make([]string, 0, 1)
+		sl = append(sl, host)
+		sl = append(sl, pl...)
+	} else {
+		sl = pl
 	}
 	return
 }
