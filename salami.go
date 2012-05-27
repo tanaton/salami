@@ -38,17 +38,17 @@ type Config struct {
 
 type Session struct {
 	url		string
-	mproc	sync.RWMutex
-	mux		sync.RWMutex
+	mproc	sync.Mutex
+	mux		sync.Mutex
 	wlist	[]http.ResponseWriter
 }
 
 type SammaryHandle struct {
 	conf	*Config
 	logger	*log.Logger
-	lb		<-chan *Balance
-	mux		sync.RWMutex
-	m		map[string]*Session
+	lb		<-chan Balance
+	sesMux	sync.Mutex
+	sesMap	map[string]*Session
 }
 
 const (
@@ -64,7 +64,7 @@ const (
 	READ_TIMEOUT_SEC_DEF			= 10
 	WRITE_TIMEOUT_SEC_DEF			= 10
 	LOG_FILE_PATH_DEF				= ""
-	MAX_HEADER_BYTES_DEF			= 1024 * 1024
+	MAX_HEADER_BYTES_DEF			= 1024 * 10
 )
 
 var g_balance_def = []*Balance{
@@ -90,8 +90,8 @@ func main() {
 	myHandler := &SammaryHandle{
 		conf	: c,
 		logger	: logger,
-		lb		: loadBalancing(c),
-		m		: make(map[string]*Session),
+		lb		: loadBalancing(c.BalanceList),
+		sesMap	: make(map[string]*Session),
 	}
 	server := &http.Server{
 		Addr			: fmt.Sprintf("%s:%d", c.Addr, c.Port),
@@ -104,15 +104,14 @@ func main() {
 	logger.Fatal(server.ListenAndServe())
 }
 
-func loadBalancing(conf *Config) <-chan *Balance {
-	ch := make(chan *Balance, LOAD_BALANCE_BUF)
+func loadBalancing(bl []*Balance) <-chan Balance {
+	ch := make(chan Balance, LOAD_BALANCE_BUF)
 	go func() {
-		max := len(conf.BalanceList)
+		max := len(bl)
 		i := 0
 		for {
-			ch <- conf.BalanceList[i]
-			i++
-			i = i % max
+			ch <- *(bl[i])
+			i = (i + 1) % max
 		}
 	}()
 	return ch
@@ -135,12 +134,14 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if it, ok := sh.mapGet(u); ok {
-		it.connAdd(w)
+	sh.sesMux.Lock()
+	if ses, ok := sh.sesMap[u]; ok {
+		ses.connAdd(w)
+		sh.sesMux.Unlock()
 
 		// 続く処理を止める
-		it.mproc.Lock()
-		defer it.mproc.Unlock()
+		ses.mproc.Lock()
+		defer ses.mproc.Unlock()
 
 		sh.logger.Printf("Collision %s", u)
 	} else {
@@ -153,11 +154,17 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		se.mproc.Lock()
 		defer se.mproc.Unlock()
 
-		sh.mapAdd(u, se)
+		sh.sesMap[u] = se			// shはまだロック中
+		sh.sesMux.Unlock()			// ここで解除
+
 		lbhost := <-sh.lb
 		sl := updatePathList(lbhost.Host, pl)
+		// この処理に時間がかかる
 		data, res, err := httpDownload(sl, lbhost.Port, r, TIMEOUT_NSEC)
-		sh.mapDelete(u)
+
+		sh.sesMux.Lock()
+		delete(sh.sesMap, u)
+		sh.sesMux.Unlock()
 
 		if err == nil {
 			se.transfer(data, res)
@@ -167,28 +174,6 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sh.logger.Print("Bad request!")
 		}
 	}
-}
-
-func (sh *SammaryHandle) mapGet(u string) (*Session, bool) {
-	sh.mux.Lock()
-	defer sh.mux.Unlock()
-
-	it, ok := sh.m[u]
-	return it, ok
-}
-
-func (sh *SammaryHandle) mapAdd(u string, se *Session) {
-	sh.mux.Lock()
-	defer sh.mux.Unlock()
-
-	sh.m[u] = se
-}
-
-func (sh *SammaryHandle) mapDelete(u string) {
-	sh.mux.Lock()
-	defer sh.mux.Unlock()
-
-	delete(sh.m, u)
 }
 
 func (sh *SammaryHandle) checkUrlWhiteList(u string) bool {
