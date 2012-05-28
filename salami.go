@@ -38,16 +38,15 @@ type Config struct {
 
 type Session struct {
 	url		string
-	mproc	sync.Mutex
-	mux		sync.Mutex
-	wlist	[]http.ResponseWriter
+	mproc	sync.RWMutex
+	wch		chan http.ResponseWriter
 }
 
 type SammaryHandle struct {
 	conf	*Config
 	logger	*log.Logger
 	lb		<-chan Balance
-	sesMux	sync.Mutex
+	sesMux	sync.RWMutex
 	sesMap	map[string]*Session
 }
 
@@ -56,6 +55,7 @@ const (
 	CRLF_STR						= "\r\n"
 	INTVAL_CONF_ERR					= 0x80000000
 	LOAD_BALANCE_BUF				= 32
+	WRITE_CHAN_BUF					= 4
 	CONFIG_JSON_PATH_DEF			= "salami.config.json"
 	ERROR_STATUS_CODE_DEF			= 400
 
@@ -134,10 +134,8 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sh.sesMux.Lock()
-	if ses, ok := sh.sesMap[u]; ok {
-		ses.connAdd(w)
-		sh.sesMux.Unlock()
+	if ses, ok := sh.getSesMap(u); ok {
+		ses.wch <- w
 
 		// 続く処理を止める
 		ses.mproc.Lock()
@@ -148,23 +146,21 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 1度目のアクセス
 		se := &Session{
 			url		: u,
-			wlist	: []http.ResponseWriter{w},
+			wch		: make(chan http.ResponseWriter, WRITE_CHAN_BUF),
 		}
 		// 続く処理を止める
 		se.mproc.Lock()
 		defer se.mproc.Unlock()
 
-		sh.sesMap[u] = se			// shはまだロック中
-		sh.sesMux.Unlock()			// ここで解除
+		// 設定
+		se.wch <- w
 
+		sh.setSesMap(u, se)
 		lbhost := <-sh.lb
 		sl := updatePathList(lbhost.Host, pl)
 		// この処理に時間がかかる
 		data, res, err := httpDownload(sl, lbhost.Port, r, TIMEOUT_NSEC)
-
-		sh.sesMux.Lock()
-		delete(sh.sesMap, u)
-		sh.sesMux.Unlock()
+		sh.delSesMap(u)
 
 		if err == nil {
 			se.transfer(data, res)
@@ -176,6 +172,28 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (sh *SammaryHandle) getSesMap(u string) (ses *Session, ok bool) {
+	sh.sesMux.Lock()
+	defer sh.sesMux.Unlock()
+
+	ses, ok = sh.sesMap[u];
+	return
+}
+
+func (sh *SammaryHandle) setSesMap(u string, ses *Session) {
+	sh.sesMux.Lock()
+	defer sh.sesMux.Unlock()
+
+	sh.sesMap[u] = ses
+}
+
+func (sh *SammaryHandle) delSesMap(u string) {
+	sh.sesMux.Lock()
+	defer sh.sesMux.Unlock()
+
+	delete(sh.sesMap, u)
+}
+
 func (sh *SammaryHandle) checkUrlWhiteList(u string) bool {
 	for _, reg := range sh.conf.URLWhiteList {
 		if reg.MatchString(u) {
@@ -185,22 +203,36 @@ func (sh *SammaryHandle) checkUrlWhiteList(u string) bool {
 	return false
 }
 
-func (se *Session) connAdd(w http.ResponseWriter) {
-	se.mux.Lock()
-	defer se.mux.Unlock()
+func (se *Session) getWriteList() []http.ResponseWriter {
+	wlist := make([]http.ResponseWriter, 0, WRITE_CHAN_BUF)
+	lp := 0
 
-	se.wlist = append(se.wlist, w)
+CREATE_WRITE_LIST:
+	for lp < 10 {
+		select {
+		case resw, ok := <-se.wch:
+			if ok {
+				wlist = append(wlist, resw)
+			} else {
+				break CREATE_WRITE_LIST
+			}
+		default:
+			// 通信なし
+			lp++
+		}
+	}
+	close(se.wch)
+
+	return wlist
 }
 
 func (se *Session) transfer(data []byte, res *http.Response) {
-	se.mux.Lock()
-	defer se.mux.Unlock()
-
-	para := len(se.wlist)
+	wlist := se.getWriteList()
+	para := len(wlist)
 	sync := make(chan bool, para)
 	defer close(sync)
 
-	for _, resw := range se.wlist {
+	for _, resw := range wlist {
 		// ネットワーク書き込みは並列で実行
 		sync <- true
 		go func(w http.ResponseWriter) {
@@ -218,18 +250,15 @@ func (se *Session) transfer(data []byte, res *http.Response) {
 	for ; para > 0; para-- {
 		sync <- true
 	}
-	se.wlist = nil
 }
 
 func (se *Session) transferBad() {
-	se.mux.Lock()
-	defer se.mux.Unlock()
-
-	para := len(se.wlist)
+	wlist := se.getWriteList()
+	para := len(wlist)
 	sync := make(chan bool, para)
 	defer close(sync)
 
-	for _, resw := range se.wlist {
+	for _, resw := range wlist {
 		// ネットワーク書き込みは並列で実行
 		sync <- true
 		go func(w http.ResponseWriter) {
@@ -241,7 +270,6 @@ func (se *Session) transferBad() {
 	for ; para > 0; para-- {
 		sync <- true
 	}
-	se.wlist = nil
 }
 
 // TCP接続
