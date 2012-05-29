@@ -37,15 +37,19 @@ type Config struct {
 }
 
 type Session struct {
-	url		string
-	mproc	sync.RWMutex
-	wch		chan http.ResponseWriter
+	wlist	[]*WaitWriter
+	mux		sync.RWMutex
+}
+
+type WaitWriter struct {
+	resw	http.ResponseWriter
+	sync	chan error
 }
 
 type SammaryHandle struct {
 	conf	*Config
 	logger	*log.Logger
-	lb		<-chan Balance
+	lb		<-chan *Balance
 	sesMux	sync.RWMutex
 	sesMap	map[string]*Session
 }
@@ -55,7 +59,7 @@ const (
 	CRLF_STR						= "\r\n"
 	INTVAL_CONF_ERR					= 0x80000000
 	LOAD_BALANCE_BUF				= 32
-	WRITE_CHAN_BUF					= 4
+	WRITE_PARALELL					= 8
 	CONFIG_JSON_PATH_DEF			= "salami.config.json"
 	ERROR_STATUS_CODE_DEF			= 400
 
@@ -82,7 +86,7 @@ func main() {
 	} else {
 		fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0666)
 		if err != nil { log.Fatal("file open error") }
-		defer fp.Close()
+		//defer fp.Close()	実行終了で開放
 		w = fp
 	}
 	logger := log.New(w, "", log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -104,13 +108,13 @@ func main() {
 	logger.Fatal(server.ListenAndServe())
 }
 
-func loadBalancing(bl []*Balance) <-chan Balance {
-	ch := make(chan Balance, LOAD_BALANCE_BUF)
+func loadBalancing(bl []*Balance) <-chan *Balance {
+	ch := make(chan *Balance, LOAD_BALANCE_BUF)
 	go func() {
 		max := len(bl)
 		i := 0
 		for {
-			ch <- *(bl[i])
+			ch <- bl[i]
 			i = (i + 1) % max
 		}
 	}()
@@ -135,25 +139,27 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ses, ok := sh.getSesMap(u); ok {
-		ses.wch <- w
-
-		// 続く処理を止める
-		ses.mproc.Lock()
-		defer ses.mproc.Unlock()
+		ww := &WaitWriter{
+			resw	: w,
+			sync	: make(chan error, 1),	// 送信側ロック防止のためバッファを1つ分用意
+		}
+		defer close(ww.sync)
+		if ses.addWriter(ww) == false {
+			// 挿入に失敗した場合
+			go ww.transferBadOnce()
+		}
+		<-ww.sync		// 転送完了まで待つ
 
 		sh.logger.Printf("Collision %s", u)
 	} else {
 		// 1度目のアクセス
 		se := &Session{
-			url		: u,
-			wch		: make(chan http.ResponseWriter, WRITE_CHAN_BUF),
+			wlist	: []*WaitWriter{
+				&WaitWriter{
+					resw	: w,
+				},
+			},
 		}
-		// 続く処理を止める
-		se.mproc.Lock()
-		defer se.mproc.Unlock()
-
-		// 設定
-		se.wch <- w
 
 		sh.setSesMap(u, se)
 		lbhost := <-sh.lb
@@ -166,7 +172,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			se.transfer(data, res)
 			sh.logger.Printf("%d %s", res.StatusCode, u)
 		} else {
-			se.transferBad()
+			se.transfer(nil, nil)
 			sh.logger.Print("Bad request!")
 		}
 	}
@@ -203,72 +209,70 @@ func (sh *SammaryHandle) checkUrlWhiteList(u string) bool {
 	return false
 }
 
-func (se *Session) getWriteList() []http.ResponseWriter {
-	wlist := make([]http.ResponseWriter, 0, WRITE_CHAN_BUF)
-	lp := 0
-
-CREATE_WRITE_LIST:
-	for lp < 10 {
-		select {
-		case resw, ok := <-se.wch:
-			if ok {
-				wlist = append(wlist, resw)
-			} else {
-				break CREATE_WRITE_LIST
-			}
-		default:
-			// 通信なし
-			lp++
-		}
-	}
-	close(se.wch)
-
-	return wlist
-}
-
 func (se *Session) transfer(data []byte, res *http.Response) {
-	wlist := se.getWriteList()
-	para := len(wlist)
+	se.mux.Lock()
+	defer se.mux.Unlock()
+
+	para := len(se.wlist)
+	if para > WRITE_PARALELL {
+		para = WRITE_PARALELL
+	}
 	sync := make(chan bool, para)
 	defer close(sync)
 
-	for _, resw := range wlist {
+	for _, it := range se.wlist {
 		// ネットワーク書き込みは並列で実行
 		sync <- true
-		go func(w http.ResponseWriter) {
-			// ヘッダーを書き込む
-			w.Header().Set("Connection", "close")
-			for key, _ := range res.Header {
-				w.Header().Set(key, res.Header.Get(key))
+		go func(ww *WaitWriter) {
+			if data != nil && res != nil {
+				ww.transferOnce(data, res)
+			} else {
+				ww.transferBadOnce()
 			}
-			w.WriteHeader(res.StatusCode)
-			// 本文を書き込む
-			w.Write(data)
 			<-sync
-		}(resw)
+		}(it)
 	}
 	for ; para > 0; para-- {
 		sync <- true
+	}
+	se.wlist = nil
+}
+
+func (se *Session) addWriter(ww *WaitWriter) bool {
+	se.mux.Lock()
+	defer se.mux.Unlock()
+
+	var ret bool
+	if se.wlist != nil {
+		se.wlist = append(se.wlist, ww)
+		ret = true
+	} else {
+		ret = false
+	}
+	return ret
+}
+
+func (ww *WaitWriter) transferOnce(data []byte, res *http.Response) {
+	// ヘッダーを書き込む
+	ww.resw.Header().Set("Connection", "close")
+	for key, _ := range res.Header {
+		ww.resw.Header().Set(key, res.Header.Get(key))
+	}
+	ww.resw.WriteHeader(res.StatusCode)
+	// 本文を書き込む
+	_, err := ww.resw.Write(data)
+	if ww.sync != nil {
+		// 停止を解除
+		ww.sync <- err
 	}
 }
 
-func (se *Session) transferBad() {
-	wlist := se.getWriteList()
-	para := len(wlist)
-	sync := make(chan bool, para)
-	defer close(sync)
-
-	for _, resw := range wlist {
-		// ネットワーク書き込みは並列で実行
-		sync <- true
-		go func(w http.ResponseWriter) {
-			// ヘッダーを書き込む
-			w.WriteHeader(ERROR_STATUS_CODE_DEF)
-			<-sync
-		}(resw)
-	}
-	for ; para > 0; para-- {
-		sync <- true
+func (ww *WaitWriter) transferBadOnce() {
+	// ヘッダーを書き込む
+	ww.resw.WriteHeader(ERROR_STATUS_CODE_DEF)
+	if ww.sync != nil {
+		// 停止を解除
+		ww.sync <- nil
 	}
 }
 
