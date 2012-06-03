@@ -61,7 +61,6 @@ const (
 	LOAD_BALANCE_BUF				= 32
 	WRITE_PARALELL					= 8
 	CONFIG_JSON_PATH_DEF			= "salami.config.json"
-	ERROR_STATUS_CODE_DEF			= 400
 
 	ADDR_DEF						= ""
 	PORT_DEF						= 18080
@@ -125,16 +124,16 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pl, err := createPathList(r.URL)
 	if err != nil {
 		// 異常
-		w.WriteHeader(ERROR_STATUS_CODE_DEF)
-		sh.logger.Print("Path error")
+		w.WriteHeader(http.StatusBadRequest)
+		sh.logger.Printf("Path error :%s", r.URL)
 		return
 	}
 	u := "http://" + strings.Join(pl, "/")
 
 	// ホワイトリストの確認
 	if sh.conf.URLWhiteList != nil && !sh.checkUrlWhiteList(u) {
-		w.WriteHeader(ERROR_STATUS_CODE_DEF)
-		sh.logger.Print("WhiteList error")
+		w.WriteHeader(http.StatusBadRequest)
+		sh.logger.Printf("WhiteList error :%s", u)
 		return
 	}
 
@@ -173,7 +172,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sh.logger.Printf("%d %s", res.StatusCode, u)
 		} else {
 			se.transfer(nil, nil)
-			sh.logger.Print("Bad request!")
+			sh.logger.Printf("Bad request => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
 		}
 	}
 }
@@ -238,26 +237,25 @@ func (se *Session) transfer(data []byte, res *http.Response) {
 	se.wlist = nil
 }
 
-func (se *Session) addWriter(ww *WaitWriter) bool {
+func (se *Session) addWriter(ww *WaitWriter) (ret bool) {
 	se.mux.Lock()
 	defer se.mux.Unlock()
 
-	var ret bool
 	if se.wlist != nil {
 		se.wlist = append(se.wlist, ww)
 		ret = true
 	} else {
 		ret = false
 	}
-	return ret
+	return
 }
 
 func (ww *WaitWriter) transferOnce(data []byte, res *http.Response) {
 	// ヘッダーを書き込む
-	ww.resw.Header().Set("Connection", "close")
 	for key, _ := range res.Header {
 		ww.resw.Header().Set(key, res.Header.Get(key))
 	}
+	ww.resw.Header().Set("Connection", "close")
 	ww.resw.WriteHeader(res.StatusCode)
 	// 本文を書き込む
 	_, err := ww.resw.Write(data)
@@ -269,7 +267,7 @@ func (ww *WaitWriter) transferOnce(data []byte, res *http.Response) {
 
 func (ww *WaitWriter) transferBadOnce() {
 	// ヘッダーを書き込む
-	ww.resw.WriteHeader(ERROR_STATUS_CODE_DEF)
+	ww.resw.WriteHeader(http.StatusBadRequest)
 	if ww.sync != nil {
 		// 停止を解除
 		ww.sync <- nil
@@ -277,23 +275,19 @@ func (ww *WaitWriter) transferBadOnce() {
 }
 
 // TCP接続
-func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) (data []byte, res *http.Response, err error){
+func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) (data []byte, res *http.Response, err error) {
 	// タイムアウトを設定(ms単位)
 	if con, e := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s[0], port), timeout); e == nil {
 		// 接続を閉じる
 		defer con.Close()
-		var req *http.Request
-		req, err = http.NewRequest("GET", "http://" + strings.Join(s, "/"), nil)
-		if err != nil { return }
+
 		// ヘッダー送信
-		con.Write(createBaseHeader(s, r))
+		fmt.Fprintf(con, "%s /%s %s" + CRLF_STR, r.Method, strings.Join(s[1:], "/"), r.Proto)
+		fmt.Fprintf(con, "Host: %s" + CRLF_STR, s[0])
 		r.Header.Write(con)
-		con.Write([]byte(CRLF_STR))
-		// ヘッダー受信
-		res, err = http.ReadResponse(bufio.NewReader(con), req)
-		if err != nil { return }
-		defer res.Body.Close()
-		data, err = ioutil.ReadAll(res.Body)
+		fmt.Fprintf(con, CRLF_STR)
+
+		data, res, err = httpReadData(con, s)
 	} else {
 		// エラーをセット
 		err = e
@@ -301,10 +295,17 @@ func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) 
 	return
 }
 
-func createBaseHeader(s []string, r *http.Request) []byte {
-	proto := r.Method + " /" + strings.Join(s[1:], "/") + " " + r.Proto + CRLF_STR
-	host := "Host: " + s[0] + CRLF_STR
-	return []byte(proto + host)
+func httpReadData(con net.Conn, s []string) (data []byte, res *http.Response, err error) {
+	var req *http.Request
+	req, err = http.NewRequest("GET", "http://" + strings.Join(s, "/"), nil)
+	if err != nil { return }
+	// ヘッダー受信
+	res, err = http.ReadResponse(bufio.NewReader(con), req)
+	if err != nil { return }
+	defer res.Body.Close()
+	// データ受信
+	data, err = ioutil.ReadAll(res.Body)
+	return
 }
 
 func createPathList(u *url.URL) (pl []string, err error) {
@@ -317,7 +318,7 @@ func createPathList(u *url.URL) (pl []string, err error) {
 
 func updatePathList(host string, pl []string) (sl []string) {
 	if host != "" {
-		sl = make([]string, 0, 1)
+		sl = make([]string, 0, len(pl) + 1)
 		sl = append(sl, host)
 		sl = append(sl, pl...)
 	} else {
