@@ -38,7 +38,7 @@ type Config struct {
 
 type Session struct {
 	wlist	[]*WaitWriter
-	mux		sync.RWMutex
+	mux		sync.Mutex
 }
 
 type WaitWriter struct {
@@ -46,28 +46,28 @@ type WaitWriter struct {
 	sync	chan error
 }
 
-type SammaryHandle struct {
+type SummaryHandle struct {
+	confMux	sync.Mutex
 	conf	*Config
 	logger	*log.Logger
-	lb		<-chan *Balance
-	sesMux	sync.RWMutex
+	lb		<-chan Balance
+	sesMux	sync.Mutex
 	sesMap	map[string]*Session
 }
 
 const (
-	TIMEOUT_NSEC	time.Duration	= 8 * 1000 * 1000 * 1000
-	CRLF_STR						= "\r\n"
-	INTVAL_CONF_ERR					= 0x80000000
-	LOAD_BALANCE_BUF				= 32
-	WRITE_PARALELL					= 8
-	CONFIG_JSON_PATH_DEF			= "salami.config.json"
+	DIAL_TIMEOUT_DEF	time.Duration	= 8 * time.Second
+	CRLF_STR							= "\r\n"
+	LOAD_BALANCE_BUF					= 32
+	WRITE_PARALELL						= 8
+	CONFIG_JSON_PATH_DEF				= "salami.config.json"
 
-	ADDR_DEF						= ""
-	PORT_DEF						= 18080
-	READ_TIMEOUT_SEC_DEF			= 10
-	WRITE_TIMEOUT_SEC_DEF			= 10
-	LOG_FILE_PATH_DEF				= ""
-	MAX_HEADER_BYTES_DEF			= 1024 * 10
+	ADDR_DEF							= ""
+	PORT_DEF							= 18080
+	READ_TIMEOUT_SEC_DEF				= 10
+	WRITE_TIMEOUT_SEC_DEF				= 10
+	LOG_FILE_PATH_DEF					= ""
+	MAX_HEADER_BYTES_DEF				= 1024 * 10
 )
 
 var g_balance_def = []*Balance{
@@ -88,11 +88,11 @@ func main() {
 		//defer fp.Close()	実行終了で開放
 		w = fp
 	}
-	logger := log.New(w, "", log.Ldate | log.Ltime | log.Lmicroseconds)
+	logw := log.New(w, "", log.Ldate | log.Ltime | log.Lmicroseconds)
 
-	myHandler := &SammaryHandle{
+	myHandler := &SummaryHandle{
 		conf	: c,
-		logger	: logger,
+		logger	: logw,
 		lb		: loadBalancing(c.BalanceList),
 		sesMap	: make(map[string]*Session),
 	}
@@ -104,23 +104,23 @@ func main() {
 		MaxHeaderBytes	: c.MaxHeaderBytes,
 	}
 	// サーバ起動
-	logger.Fatal(server.ListenAndServe())
+	logw.Fatal(server.ListenAndServe())
 }
 
-func loadBalancing(bl []*Balance) <-chan *Balance {
-	ch := make(chan *Balance, LOAD_BALANCE_BUF)
+func loadBalancing(bl []*Balance) <-chan Balance {
+	ch := make(chan Balance, LOAD_BALANCE_BUF)
 	go func() {
 		max := len(bl)
 		i := 0
 		for {
-			ch <- bl[i]
+			ch <- *(bl[i])
 			i = (i + 1) % max
 		}
 	}()
 	return ch
 }
 
-func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pl, err := createPathList(r.URL)
 	if err != nil {
 		// 異常
@@ -131,7 +131,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u := "http://" + strings.Join(pl, "/")
 
 	// ホワイトリストの確認
-	if sh.conf.URLWhiteList != nil && !sh.checkUrlWhiteList(u) {
+	if sh.checkUrlWhiteList(u) == false {
 		w.WriteHeader(http.StatusBadRequest)
 		sh.logger.Printf("WhiteList error :%s", u)
 		return
@@ -140,22 +140,27 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ses, ok := sh.getSesMap(u); ok {
 		ww := &WaitWriter{
 			resw	: w,
-			sync	: make(chan error, 1),	// 送信側ロック防止のためバッファを1つ分用意
+			sync	: make(chan error, 1),
 		}
 		defer close(ww.sync)
 		if ses.addWriter(ww) == false {
 			// 挿入に失敗した場合
 			go ww.transferBadOnce()
 		}
-		<-ww.sync		// 転送完了まで待つ
+		err := <-ww.sync		// 転送完了まで待つ
 
-		sh.logger.Printf("Collision %s", u)
+		if err == nil {
+			sh.logger.Printf("Collision %s", u)
+		} else {
+			sh.logger.Printf("Collision error URL:%s Message:%s", u, err.Error())
+		}
 	} else {
 		// 1度目のアクセス
 		se := &Session{
 			wlist	: []*WaitWriter{
 				&WaitWriter{
 					resw	: w,
+					sync	: nil,
 				},
 			},
 		}
@@ -164,7 +169,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lbhost := <-sh.lb
 		sl := updatePathList(lbhost.Host, pl)
 		// この処理に時間がかかる
-		data, res, err := httpDownload(sl, lbhost.Port, r, TIMEOUT_NSEC)
+		data, res, err := httpDownload(sl, lbhost.Port, r, DIAL_TIMEOUT_DEF)
 		sh.delSesMap(u)
 
 		if err == nil {
@@ -177,7 +182,7 @@ func (sh *SammaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (sh *SammaryHandle) getSesMap(u string) (ses *Session, ok bool) {
+func (sh *SummaryHandle) getSesMap(u string) (ses *Session, ok bool) {
 	sh.sesMux.Lock()
 	defer sh.sesMux.Unlock()
 
@@ -185,23 +190,31 @@ func (sh *SammaryHandle) getSesMap(u string) (ses *Session, ok bool) {
 	return
 }
 
-func (sh *SammaryHandle) setSesMap(u string, ses *Session) {
+func (sh *SummaryHandle) setSesMap(u string, ses *Session) {
 	sh.sesMux.Lock()
 	defer sh.sesMux.Unlock()
 
 	sh.sesMap[u] = ses
 }
 
-func (sh *SammaryHandle) delSesMap(u string) {
+func (sh *SummaryHandle) delSesMap(u string) {
 	sh.sesMux.Lock()
 	defer sh.sesMux.Unlock()
 
 	delete(sh.sesMap, u)
 }
 
-func (sh *SammaryHandle) checkUrlWhiteList(u string) bool {
+func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
+	sh.confMux.Lock()
+	defer sh.confMux.Unlock()
+
+	if sh.conf.URLWhiteList == nil {
+		// ホワイトリストが無い
+		return true
+	}
 	for _, reg := range sh.conf.URLWhiteList {
 		if reg.MatchString(u) {
+			// リストと一致
 			return true
 		}
 	}
@@ -287,7 +300,8 @@ func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) 
 		r.Header.Write(con)
 		fmt.Fprintf(con, CRLF_STR)
 
-		data, res, err = httpReadData(con, s)
+		// データ受信
+		data, res, err = httpReadData(con, r)
 	} else {
 		// エラーをセット
 		err = e
@@ -295,10 +309,7 @@ func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) 
 	return
 }
 
-func httpReadData(con net.Conn, s []string) (data []byte, res *http.Response, err error) {
-	var req *http.Request
-	req, err = http.NewRequest("GET", "http://" + strings.Join(s, "/"), nil)
-	if err != nil { return }
+func httpReadData(con net.Conn, req *http.Request) (data []byte, res *http.Response, err error) {
 	// ヘッダー受信
 	res, err = http.ReadResponse(bufio.NewReader(con), req)
 	if err != nil { return }
