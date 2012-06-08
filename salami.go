@@ -124,7 +124,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pl, err := createPathList(r.URL)
 	if err != nil {
 		// 異常
-		w.WriteHeader(http.StatusBadRequest)
+		badResponse(w)
 		sh.logger.Printf("Path error :%s", r.URL)
 		return
 	}
@@ -132,7 +132,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
-		w.WriteHeader(http.StatusBadRequest)
+		badResponse(w)
 		sh.logger.Printf("WhiteList error :%s", u)
 		return
 	}
@@ -279,20 +279,27 @@ func (ww *WaitWriter) transferOnce(data []byte, res *http.Response) {
 }
 
 func (ww *WaitWriter) transferBadOnce() {
-	// ヘッダーを書き込む
-	ww.resw.WriteHeader(http.StatusBadRequest)
+	badResponse(ww.resw)
 	if ww.sync != nil {
 		// 停止を解除
 		ww.sync <- nil
 	}
 }
 
+func badResponse(w http.ResponseWriter) {
+	// ヘッダーを書き込む
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusBadRequest)
+}
+
 // TCP接続
 func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) (data []byte, res *http.Response, err error) {
-	// タイムアウトを設定(ms単位)
+	// 名前解決のタイムアウトを設定
 	if con, e := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s[0], port), timeout); e == nil {
 		// 接続を閉じる
 		defer con.Close()
+		// 通信のタイムアウトを設定
+		con.SetDeadline(time.Now().Add(timeout))
 
 		// ヘッダー送信
 		fmt.Fprintf(con, "%s /%s %s" + CRLF_STR, r.Method, strings.Join(s[1:], "/"), r.Proto)
