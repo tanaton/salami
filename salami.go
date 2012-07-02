@@ -38,7 +38,7 @@ type Config struct {
 
 type Session struct {
 	wlist	[]*WaitWriter
-	mux		sync.Mutex
+	mux		sync.RWMutex
 }
 
 type WaitWriter struct {
@@ -47,11 +47,11 @@ type WaitWriter struct {
 }
 
 type SummaryHandle struct {
-	confMux	sync.Mutex
+	confMux	sync.RWMutex
 	conf	*Config
 	logger	*log.Logger
 	lb		<-chan Balance
-	sesMux	sync.Mutex
+	sesMux	sync.RWMutex
 	sesMap	map[string]*Session
 }
 
