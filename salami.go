@@ -30,42 +30,32 @@ type Config struct {
 	Port				int
 	ReadTimeoutSec		int
 	WriteTimeoutSec		int
+	ProxyTimeoutSec		int
 	MaxHeaderBytes		int
 	LogFilePath			string
 	URLWhiteList		[]*regexp.Regexp
 	BalanceList			[]*Balance
 }
 
-type Session struct {
-	wlist	[]*WaitWriter
-	mux		sync.RWMutex
-}
-
-type WaitWriter struct {
-	resw	http.ResponseWriter
-	sync	chan error
-}
-
 type SummaryHandle struct {
-	confMux	sync.RWMutex
 	conf	*Config
 	logger	*log.Logger
+	timeout	time.Duration
 	lb		<-chan Balance
 	sesMux	sync.RWMutex
-	sesMap	map[string]*Session
+	sesMap	map[string]bool
 }
 
 const (
-	DIAL_TIMEOUT_DEF	time.Duration	= 8 * time.Second
 	CRLF_STR							= "\r\n"
 	LOAD_BALANCE_BUF					= 32
-	WRITE_PARALELL						= 8
 	CONFIG_JSON_PATH_DEF				= "salami.config.json"
 
 	ADDR_DEF							= ""
 	PORT_DEF							= 18080
-	READ_TIMEOUT_SEC_DEF				= 10
-	WRITE_TIMEOUT_SEC_DEF				= 10
+	READ_TIMEOUT_SEC_DEF				= 15
+	WRITE_TIMEOUT_SEC_DEF				= 15
+	PROXY_TIMEOUT_SEC_DEF				= 12
 	LOG_FILE_PATH_DEF					= ""
 	MAX_HEADER_BYTES_DEF				= 1024 * 10
 )
@@ -93,8 +83,9 @@ func main() {
 	myHandler := &SummaryHandle{
 		conf	: c,
 		logger	: logw,
+		timeout	: time.Duration(c.ProxyTimeoutSec) * time.Second,
 		lb		: loadBalancing(c.BalanceList),
-		sesMap	: make(map[string]*Session),
+		sesMap	: make(map[string]bool),
 	}
 	server := &http.Server{
 		Addr			: fmt.Sprintf("%s:%d", c.Addr, c.Port),
@@ -124,7 +115,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pl, err := createPathList(r.URL)
 	if err != nil {
 		// 異常
-		badResponse(w)
+		badRequest(w)
 		sh.logger.Printf("Path error :%s", r.URL)
 		return
 	}
@@ -132,69 +123,47 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
-		badResponse(w)
+		badRequest(w)
 		sh.logger.Printf("WhiteList error :%s", u)
 		return
 	}
 
-	if ses, ok := sh.getSesMap(u); ok {
-		ww := &WaitWriter{
-			resw	: w,
-			sync	: make(chan error, 1),
-		}
-		defer close(ww.sync)
-		if ses.addWriter(ww) == false {
-			// 挿入に失敗した場合
-			go ww.transferBadOnce()
-		}
-		err := <-ww.sync		// 転送完了まで待つ
-
-		if err == nil {
-			sh.logger.Printf("Collision %s", u)
-		} else {
-			sh.logger.Printf("Collision error URL:%s Message:%s", u, err.Error())
-		}
+	if ok := sh.getSesMap(u); ok {
+		// 衝突
+		conflictResponse(w)
+		sh.logger.Printf("Conflict %s", u)
 	} else {
 		// 1度目のアクセス
-		se := &Session{
-			wlist	: []*WaitWriter{
-				&WaitWriter{
-					resw	: w,
-					sync	: nil,
-				},
-			},
-		}
+		sh.setSesMap(u)
+		defer sh.delSesMap(u)
 
-		sh.setSesMap(u, se)
 		lbhost := <-sh.lb
 		sl := updatePathList(lbhost.Host, pl)
 		// この処理に時間がかかる
-		data, res, err := httpDownload(sl, lbhost.Port, r, DIAL_TIMEOUT_DEF)
-		sh.delSesMap(u)
+		code, err := httpCopy(sl, lbhost.Port, w, r, sh.timeout)
 
 		if err == nil {
-			se.transfer(data, res)
-			sh.logger.Printf("%d %s", res.StatusCode, u)
+			sh.logger.Printf("%d %s", code, u)
 		} else {
-			se.transfer(nil, nil)
-			sh.logger.Printf("Bad request => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
+			gatewayTimeoutResponse(w)
+			sh.logger.Printf("Bad Response => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
 		}
 	}
 }
 
-func (sh *SummaryHandle) getSesMap(u string) (ses *Session, ok bool) {
-	sh.sesMux.Lock()
-	defer sh.sesMux.Unlock()
+func (sh *SummaryHandle) getSesMap(u string) bool {
+	sh.sesMux.RLock()
+	defer sh.sesMux.RUnlock()
 
-	ses, ok = sh.sesMap[u];
-	return
+	_, ok := sh.sesMap[u];
+	return ok
 }
 
-func (sh *SummaryHandle) setSesMap(u string, ses *Session) {
+func (sh *SummaryHandle) setSesMap(u string) {
 	sh.sesMux.Lock()
 	defer sh.sesMux.Unlock()
 
-	sh.sesMap[u] = ses
+	sh.sesMap[u] = true
 }
 
 func (sh *SummaryHandle) delSesMap(u string) {
@@ -205,13 +174,11 @@ func (sh *SummaryHandle) delSesMap(u string) {
 }
 
 func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
-	sh.confMux.Lock()
-	defer sh.confMux.Unlock()
-
 	if sh.conf.URLWhiteList == nil {
 		// ホワイトリストが無い
 		return true
 	}
+	// 正規表現は複数のゴールーチンから扱える
 	for _, reg := range sh.conf.URLWhiteList {
 		if reg.MatchString(u) {
 			// リストと一致
@@ -221,82 +188,28 @@ func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
 	return false
 }
 
-func (se *Session) transfer(data []byte, res *http.Response) {
-	se.mux.Lock()
-	defer se.mux.Unlock()
-
-	para := len(se.wlist)
-	if para > WRITE_PARALELL {
-		para = WRITE_PARALELL
-	}
-	sync := make(chan bool, para)
-	defer close(sync)
-
-	for _, it := range se.wlist {
-		// ネットワーク書き込みは並列で実行
-		sync <- true
-		go func(ww *WaitWriter) {
-			if data != nil && res != nil {
-				ww.transferOnce(data, res)
-			} else {
-				ww.transferBadOnce()
-			}
-			<-sync
-		}(it)
-	}
-	for ; para > 0; para-- {
-		sync <- true
-	}
-	se.wlist = nil
-}
-
-func (se *Session) addWriter(ww *WaitWriter) (ret bool) {
-	se.mux.Lock()
-	defer se.mux.Unlock()
-
-	if se.wlist != nil {
-		se.wlist = append(se.wlist, ww)
-		ret = true
-	} else {
-		ret = false
-	}
-	return
-}
-
-func (ww *WaitWriter) transferOnce(data []byte, res *http.Response) {
-	// ヘッダーを書き込む
-	for key, _ := range res.Header {
-		ww.resw.Header().Set(key, res.Header.Get(key))
-	}
-	ww.resw.Header().Set("Connection", "close")
-	ww.resw.WriteHeader(res.StatusCode)
-	// 本文を書き込む
-	_, err := ww.resw.Write(data)
-	if ww.sync != nil {
-		// 停止を解除
-		ww.sync <- err
-	}
-}
-
-func (ww *WaitWriter) transferBadOnce() {
-	badResponse(ww.resw)
-	if ww.sync != nil {
-		// 停止を解除
-		ww.sync <- nil
-	}
-}
-
-func badResponse(w http.ResponseWriter) {
+func badRequest(w http.ResponseWriter) {
 	// ヘッダーを書き込む
 	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(http.StatusBadRequest)		// 400
+}
+
+func conflictResponse(w http.ResponseWriter) {
+	// ヘッダーを書き込む
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusConflict)			// 409
+}
+
+func gatewayTimeoutResponse(w http.ResponseWriter) {
+	// ヘッダーを書き込む
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusGatewayTimeout)	// 504
 }
 
 // TCP接続
-func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) (data []byte, res *http.Response, err error) {
+func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, timeout time.Duration) (code int, err error) {
 	// 名前解決のタイムアウトを設定
 	if con, e := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s[0], port), timeout); e == nil {
-		// 接続を閉じる
 		defer con.Close()
 		// 通信のタイムアウトを設定
 		con.SetDeadline(time.Now().Add(timeout))
@@ -307,22 +220,27 @@ func httpDownload(s []string, port int, r *http.Request, timeout time.Duration) 
 		r.Header.Write(con)
 		fmt.Fprintf(con, CRLF_STR)
 
-		// データ受信
-		data, res, err = httpReadData(con, r)
+		// ヘッダー受信
+		if res, e := http.ReadResponse(bufio.NewReader(con), r); e == nil {
+			defer res.Body.Close()
+			code = res.StatusCode
+			// ヘッダーを書き込む
+			for key, _ := range res.Header {
+				w.Header().Set(key, res.Header.Get(key))
+			}
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(code)
+			if code < 300 {
+				// 本文を書き込む
+				io.Copy(w, res.Body)
+			}
+		} else {
+			err = e
+		}
 	} else {
 		// エラーをセット
 		err = e
 	}
-	return
-}
-
-func httpReadData(con net.Conn, req *http.Request) (data []byte, res *http.Response, err error) {
-	// ヘッダー受信
-	res, err = http.ReadResponse(bufio.NewReader(con), req)
-	if err != nil { return }
-	defer res.Body.Close()
-	// データ受信
-	data, err = ioutil.ReadAll(res.Body)
 	return
 }
 
@@ -370,6 +288,7 @@ func (c *Config) readConfig(filename string) error {
 	c.Port = c.getDataInt("Port", PORT_DEF)
 	c.ReadTimeoutSec = c.getDataInt("ReadTimeoutSec", READ_TIMEOUT_SEC_DEF)
 	c.WriteTimeoutSec = c.getDataInt("WriteTimeoutSec", WRITE_TIMEOUT_SEC_DEF)
+	c.ProxyTimeoutSec = c.getDataInt("ProxyTimeoutSec", PROXY_TIMEOUT_SEC_DEF)
 	c.MaxHeaderBytes = c.getDataInt("MaxHeaderBytes", MAX_HEADER_BYTES_DEF)
 	c.LogFilePath = c.getDataString("LogFilePath", LOG_FILE_PATH_DEF)
 
@@ -407,6 +326,7 @@ func (c *Config) readDefault() {
 	c.Port = PORT_DEF
 	c.ReadTimeoutSec = READ_TIMEOUT_SEC_DEF
 	c.WriteTimeoutSec = WRITE_TIMEOUT_SEC_DEF
+	c.ProxyTimeoutSec = PROXY_TIMEOUT_SEC_DEF
 	c.MaxHeaderBytes = MAX_HEADER_BYTES_DEF
 	c.LogFilePath = LOG_FILE_PATH_DEF
 	c.URLWhiteList = nil
