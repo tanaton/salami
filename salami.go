@@ -20,50 +20,50 @@ import (
 )
 
 type Balance struct {
-	Host	string
-	Port	int
+	Host string
+	Port int
 }
 
 type Config struct {
-	v					map[string]interface{}
-	Addr				string
-	Port				int
-	ReadTimeoutSec		int
-	WriteTimeoutSec		int
-	ProxyTimeoutSec		int
-	MaxHeaderBytes		int
-	LogFilePath			string
-	URLWhiteList		[]*regexp.Regexp
-	BalanceList			[]*Balance
+	v               map[string]interface{}
+	Addr            string
+	Port            int
+	ReadTimeoutSec  int
+	WriteTimeoutSec int
+	ProxyTimeoutSec int
+	MaxHeaderBytes  int
+	LogFilePath     string
+	URLWhiteList    []*regexp.Regexp
+	BalanceList     []*Balance
 }
 
 type SummaryHandle struct {
-	conf	*Config
-	logger	*log.Logger
-	timeout	time.Duration
-	lb		<-chan Balance
-	sesMux	sync.RWMutex
-	sesMap	map[string]bool
+	conf    *Config
+	logger  *log.Logger
+	timeout time.Duration
+	lb      <-chan Balance
+	sesMux  sync.RWMutex
+	sesMap  map[string]bool
 }
 
 const (
-	CRLF_STR							= "\r\n"
-	LOAD_BALANCE_BUF					= 32
-	CONFIG_JSON_PATH_DEF				= "salami.config.json"
+	CRLF_STR             = "\r\n"
+	LOAD_BALANCE_BUF     = 32
+	CONFIG_JSON_PATH_DEF = "salami.config.json"
 
-	ADDR_DEF							= ""
-	PORT_DEF							= 18080
-	READ_TIMEOUT_SEC_DEF				= 15
-	WRITE_TIMEOUT_SEC_DEF				= 15
-	PROXY_TIMEOUT_SEC_DEF				= 12
-	LOG_FILE_PATH_DEF					= ""
-	MAX_HEADER_BYTES_DEF				= 1024 * 10
+	ADDR_DEF              = ""
+	PORT_DEF              = 18080
+	READ_TIMEOUT_SEC_DEF  = 15
+	WRITE_TIMEOUT_SEC_DEF = 15
+	PROXY_TIMEOUT_SEC_DEF = 12
+	LOG_FILE_PATH_DEF     = ""
+	MAX_HEADER_BYTES_DEF  = 1024 * 10
 )
 
 var g_balance_def = []*Balance{
 	&Balance{
-		Host	: "",
-		Port	: 80,
+		Host: "",
+		Port: 80,
 	},
 }
 
@@ -73,26 +73,28 @@ func main() {
 	if c.LogFilePath == "" {
 		w = os.Stdout
 	} else {
-		fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0666)
-		if err != nil { log.Fatal("file open error") }
+		fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+		if err != nil {
+			log.Fatal("file open error")
+		}
 		//defer fp.Close()	実行終了で開放
 		w = fp
 	}
-	logw := log.New(w, "", log.Ldate | log.Ltime | log.Lmicroseconds)
+	logw := log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
 	myHandler := &SummaryHandle{
-		conf	: c,
-		logger	: logw,
-		timeout	: time.Duration(c.ProxyTimeoutSec) * time.Second,
-		lb		: loadBalancing(c.BalanceList),
-		sesMap	: make(map[string]bool),
+		conf:    c,
+		logger:  logw,
+		timeout: time.Duration(c.ProxyTimeoutSec) * time.Second,
+		lb:      loadBalancing(c.BalanceList),
+		sesMap:  make(map[string]bool),
 	}
 	server := &http.Server{
-		Addr			: fmt.Sprintf("%s:%d", c.Addr, c.Port),
-		Handler			: myHandler,
-		ReadTimeout		: time.Duration(c.ReadTimeoutSec) * time.Second,
-		WriteTimeout	: time.Duration(c.WriteTimeoutSec) * time.Second,
-		MaxHeaderBytes	: c.MaxHeaderBytes,
+		Addr:           fmt.Sprintf("%s:%d", c.Addr, c.Port),
+		Handler:        myHandler,
+		ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
+		WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
+		MaxHeaderBytes: c.MaxHeaderBytes,
 	}
 	// サーバ起動
 	logw.Fatal(server.ListenAndServe())
@@ -155,7 +157,7 @@ func (sh *SummaryHandle) getSesMap(u string) bool {
 	sh.sesMux.RLock()
 	defer sh.sesMux.RUnlock()
 
-	_, ok := sh.sesMap[u];
+	_, ok := sh.sesMap[u]
 	return ok
 }
 
@@ -191,19 +193,19 @@ func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
 func badRequest(w http.ResponseWriter) {
 	// ヘッダーを書き込む
 	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusBadRequest)		// 400
+	w.WriteHeader(http.StatusBadRequest) // 400
 }
 
 func conflictResponse(w http.ResponseWriter) {
 	// ヘッダーを書き込む
 	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusConflict)			// 409
+	w.WriteHeader(http.StatusConflict) // 409
 }
 
 func gatewayTimeoutResponse(w http.ResponseWriter) {
 	// ヘッダーを書き込む
 	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusGatewayTimeout)	// 504
+	w.WriteHeader(http.StatusGatewayTimeout) // 504
 }
 
 // TCP接続
@@ -215,8 +217,8 @@ func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, time
 		con.SetDeadline(time.Now().Add(timeout))
 
 		// ヘッダー送信
-		fmt.Fprintf(con, "%s /%s %s" + CRLF_STR, r.Method, strings.Join(s[1:], "/"), r.Proto)
-		fmt.Fprintf(con, "Host: %s" + CRLF_STR, s[0])
+		fmt.Fprintf(con, "%s /%s %s"+CRLF_STR, r.Method, strings.Join(s[1:], "/"), r.Proto)
+		fmt.Fprintf(con, "Host: %s"+CRLF_STR, s[0])
 		r.Header.Write(con)
 		fmt.Fprintf(con, CRLF_STR)
 
@@ -254,7 +256,7 @@ func createPathList(u *url.URL) (pl []string, err error) {
 
 func updatePathList(host string, pl []string) (sl []string) {
 	if host != "" {
-		sl = make([]string, 0, len(pl) + 1)
+		sl = make([]string, 0, len(pl)+1)
 		sl = append(sl, host)
 		sl = append(sl, pl...)
 	} else {
@@ -281,9 +283,13 @@ func readConfig() *Config {
 
 func (c *Config) readConfig(filename string) error {
 	data, err := ioutil.ReadFile(filename)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	err = json.Unmarshal(data, &c.v)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	c.Addr = c.getDataString("Addr", ADDR_DEF)
 	c.Port = c.getDataInt("Port", PORT_DEF)
 	c.ReadTimeoutSec = c.getDataInt("ReadTimeoutSec", READ_TIMEOUT_SEC_DEF)
@@ -305,10 +311,12 @@ func (c *Config) readConfig(filename string) error {
 		for _, it := range list {
 			if d := strings.Split(it, ":"); len(d) == 2 {
 				num, err := strconv.ParseInt(d[1], 10, 16)
-				if err != nil { break }
+				if err != nil {
+					break
+				}
 				c.BalanceList = append(c.BalanceList, &Balance{
-					Host	: d[0],
-					Port	: int(num),
+					Host: d[0],
+					Port: int(num),
 				})
 			} else {
 				break
@@ -370,4 +378,3 @@ func (c *Config) getDataStringArray(h string, def []string) (ret []string) {
 	}
 	return
 }
-
