@@ -34,7 +34,7 @@ type Config struct {
 	MaxHeaderBytes  int
 	LogFilePath     string
 	URLWhiteList    []*regexp.Regexp
-	BalanceList     []*Balance
+	BalanceList     []Balance
 }
 
 type SummaryHandle struct {
@@ -60,8 +60,8 @@ const (
 	MAX_HEADER_BYTES_DEF  = 1024 * 10
 )
 
-var g_balance_def = []*Balance{
-	&Balance{
+var g_balance_def = []Balance{
+	Balance{
 		Host: "",
 		Port: 80,
 	},
@@ -100,13 +100,13 @@ func main() {
 	logw.Fatal(server.ListenAndServe())
 }
 
-func loadBalancing(bl []*Balance) <-chan Balance {
+func loadBalancing(bl []Balance) <-chan Balance {
 	ch := make(chan Balance, LOAD_BALANCE_BUF)
 	go func() {
 		max := len(bl)
 		i := 0
 		for {
-			ch <- *(bl[i])
+			ch <- bl[i]
 			i = (i + 1) % max
 		}
 	}()
@@ -232,7 +232,7 @@ func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, time
 			}
 			w.Header().Set("Connection", "close")
 			w.WriteHeader(code)
-			if code < 300 {
+			if code >= 200 && code < 300 {
 				// 本文を書き込む
 				io.Copy(w, res.Body)
 			}
@@ -256,8 +256,9 @@ func createPathList(u *url.URL) (pl []string, err error) {
 
 func updatePathList(host string, pl []string) (sl []string) {
 	if host != "" {
-		sl = make([]string, 0, len(pl)+1)
-		sl = append(sl, host)
+		sl = []string{
+			host,
+		}
 		sl = append(sl, pl...)
 	} else {
 		sl = pl
@@ -299,7 +300,7 @@ func (c *Config) readConfig(filename string) error {
 	c.LogFilePath = c.getDataString("LogFilePath", LOG_FILE_PATH_DEF)
 
 	if list := c.getDataStringArray("URLWhiteList", nil); list != nil {
-		c.URLWhiteList = make([]*regexp.Regexp, 0, 1)
+		c.URLWhiteList = []*regexp.Regexp{}
 		for _, it := range list {
 			c.URLWhiteList = append(c.URLWhiteList, regexp.MustCompile(it))
 		}
@@ -307,14 +308,14 @@ func (c *Config) readConfig(filename string) error {
 		c.URLWhiteList = nil
 	}
 	if list := c.getDataStringArray("BalanceList", nil); list != nil {
-		c.BalanceList = make([]*Balance, 0, 1)
+		c.BalanceList = []Balance{}
 		for _, it := range list {
 			if d := strings.Split(it, ":"); len(d) == 2 {
 				num, err := strconv.ParseInt(d[1], 10, 16)
 				if err != nil {
 					break
 				}
-				c.BalanceList = append(c.BalanceList, &Balance{
+				c.BalanceList = append(c.BalanceList, Balance{
 					Host: d[0],
 					Port: int(num),
 				})
@@ -365,7 +366,7 @@ func (c *Config) getDataStringArray(h string, def []string) (ret []string) {
 	ret = def
 	if inter, ok := c.v[h]; ok {
 		if iterarr, ok := inter.([]interface{}); ok {
-			ret = make([]string, 0, 1)
+			ret = []string{}
 			for _, it := range iterarr {
 				if s, ok := it.(string); ok {
 					ret = append(ret, s)
