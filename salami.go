@@ -39,7 +39,6 @@ type Config struct {
 
 type SummaryHandle struct {
 	conf    *Config
-	logger  *log.Logger
 	timeout time.Duration
 	lb      <-chan Balance
 	sesMux  sync.RWMutex
@@ -66,6 +65,7 @@ var g_balance_def = []Balance{
 		Port: 80,
 	},
 }
+var g_log *log.Logger
 
 func main() {
 	c := readConfig()
@@ -80,11 +80,10 @@ func main() {
 		//defer fp.Close()	実行終了で開放
 		w = fp
 	}
-	logw := log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
 	myHandler := &SummaryHandle{
 		conf:    c,
-		logger:  logw,
 		timeout: time.Duration(c.ProxyTimeoutSec) * time.Second,
 		lb:      loadBalancing(c.BalanceList),
 		sesMap:  make(map[string]bool),
@@ -97,7 +96,7 @@ func main() {
 		MaxHeaderBytes: c.MaxHeaderBytes,
 	}
 	// サーバ起動
-	logw.Fatal(server.ListenAndServe())
+	g_log.Fatal(server.ListenAndServe())
 }
 
 func loadBalancing(bl []Balance) <-chan Balance {
@@ -118,7 +117,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 異常
 		badRequest(w)
-		sh.logger.Printf("Path error :%s", r.URL)
+		g_log.Printf("Path error :%s", r.URL)
 		return
 	}
 	u := "http://" + strings.Join(pl, "/")
@@ -126,14 +125,14 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
 		badRequest(w)
-		sh.logger.Printf("WhiteList error :%s", u)
+		g_log.Printf("WhiteList error :%s", u)
 		return
 	}
 
 	if ok := sh.getSesMap(u); ok {
 		// 衝突
 		conflictResponse(w)
-		sh.logger.Printf("Conflict %s", u)
+		g_log.Printf("Conflict %s", u)
 	} else {
 		// 1度目のアクセス
 		sh.setSesMap(u)
@@ -145,10 +144,10 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		code, err := httpCopy(sl, lbhost.Port, w, r, sh.timeout)
 
 		if err == nil {
-			sh.logger.Printf("%d %s", code, u)
+			g_log.Printf("%d %s", code, u)
 		} else {
 			gatewayTimeoutResponse(w)
-			sh.logger.Printf("Bad Response => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
+			g_log.Printf("Bad Response => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
 		}
 	}
 }
