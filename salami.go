@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +24,6 @@ type Balance struct {
 }
 
 type Config struct {
-	v               map[string]interface{}
 	Addr            string
 	Port            int
 	ReadTimeoutSec  int
@@ -33,7 +31,8 @@ type Config struct {
 	ProxyTimeoutSec int
 	MaxHeaderBytes  int
 	LogFilePath     string
-	URLWhiteList    []*regexp.Regexp
+	URLWhiteList    []string
+	URLWhiteListReg []*regexp.Regexp	`json:"-"`
 	BalanceList     []Balance
 }
 
@@ -175,12 +174,12 @@ func (sh *SummaryHandle) delSesMap(u string) {
 }
 
 func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
-	if sh.conf.URLWhiteList == nil {
+	if sh.conf.URLWhiteListReg == nil {
 		// ホワイトリストが無い
 		return true
 	}
 	// 正規表現は複数のゴールーチンから扱える
-	for _, reg := range sh.conf.URLWhiteList {
+	for _, reg := range sh.conf.URLWhiteListReg {
 		if reg.MatchString(u) {
 			// リストと一致
 			return true
@@ -266,7 +265,7 @@ func updatePathList(host string, pl []string) (sl []string) {
 }
 
 func readConfig() *Config {
-	c := &Config{v: make(map[string]interface{})}
+	c := &Config{}
 	argc := len(os.Args)
 	var path string
 	if argc == 2 {
@@ -286,45 +285,21 @@ func (c *Config) readConfig(filename string) error {
 	if err != nil {
 		return err
 	}
-	err = json.Unmarshal(data, &c.v)
+	err = json.Unmarshal(data, c)
 	if err != nil {
 		return err
 	}
-	c.Addr = c.getDataString("Addr", ADDR_DEF)
-	c.Port = c.getDataInt("Port", PORT_DEF)
-	c.ReadTimeoutSec = c.getDataInt("ReadTimeoutSec", READ_TIMEOUT_SEC_DEF)
-	c.WriteTimeoutSec = c.getDataInt("WriteTimeoutSec", WRITE_TIMEOUT_SEC_DEF)
-	c.ProxyTimeoutSec = c.getDataInt("ProxyTimeoutSec", PROXY_TIMEOUT_SEC_DEF)
-	c.MaxHeaderBytes = c.getDataInt("MaxHeaderBytes", MAX_HEADER_BYTES_DEF)
-	c.LogFilePath = c.getDataString("LogFilePath", LOG_FILE_PATH_DEF)
 
-	if list := c.getDataStringArray("URLWhiteList", nil); list != nil {
-		c.URLWhiteList = []*regexp.Regexp{}
-		for _, it := range list {
-			c.URLWhiteList = append(c.URLWhiteList, regexp.MustCompile(it))
-		}
-	} else {
-		c.URLWhiteList = nil
-	}
-	if list := c.getDataStringArray("BalanceList", nil); list != nil {
-		c.BalanceList = []Balance{}
-		for _, it := range list {
-			if d := strings.Split(it, ":"); len(d) == 2 {
-				num, err := strconv.ParseInt(d[1], 10, 16)
-				if err != nil {
-					break
-				}
-				c.BalanceList = append(c.BalanceList, Balance{
-					Host: d[0],
-					Port: int(num),
-				})
-			} else {
-				break
-			}
-		}
-	}
 	if len(c.BalanceList) == 0 {
 		c.BalanceList = g_balance_def
+	}
+	if len(c.URLWhiteList) > 0 {
+		c.URLWhiteListReg = []*regexp.Regexp{}
+		for _, it := range c.URLWhiteList {
+			c.URLWhiteListReg = append(c.URLWhiteListReg, regexp.MustCompile(it))
+		}
+	} else {
+		c.URLWhiteListReg = nil
 	}
 	return nil
 }
@@ -337,44 +312,7 @@ func (c *Config) readDefault() {
 	c.ProxyTimeoutSec = PROXY_TIMEOUT_SEC_DEF
 	c.MaxHeaderBytes = MAX_HEADER_BYTES_DEF
 	c.LogFilePath = LOG_FILE_PATH_DEF
-	c.URLWhiteList = nil
+	c.URLWhiteListReg = nil
 	c.BalanceList = g_balance_def
 }
 
-func (c *Config) getDataInt(h string, def int) (ret int) {
-	ret = def
-	if it, ok := c.v[h]; ok {
-		if f, err := it.(float64); err {
-			ret = int(f)
-		}
-	}
-	return
-}
-
-func (c *Config) getDataString(h, def string) (ret string) {
-	ret = def
-	if it, ok := c.v[h]; ok {
-		if ret, ok = it.(string); !ok {
-			ret = def
-		}
-	}
-	return
-}
-
-func (c *Config) getDataStringArray(h string, def []string) (ret []string) {
-	ret = def
-	if inter, ok := c.v[h]; ok {
-		if iterarr, ok := inter.([]interface{}); ok {
-			ret = []string{}
-			for _, it := range iterarr {
-				if s, ok := it.(string); ok {
-					ret = append(ret, s)
-				} else {
-					ret = def
-					break
-				}
-			}
-		}
-	}
-	return
-}
