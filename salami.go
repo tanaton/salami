@@ -32,7 +32,7 @@ type Config struct {
 	MaxHeaderBytes  int
 	LogFilePath     string
 	URLWhiteList    []string
-	URLWhiteListReg []*regexp.Regexp	`json:"-"`
+	URLWhiteListReg []*regexp.Regexp `json:"-"`
 	BalanceList     []Balance
 }
 
@@ -315,4 +315,3 @@ func (c *Config) readDefault() {
 	c.URLWhiteListReg = nil
 	c.BalanceList = g_balance_def
 }
-
