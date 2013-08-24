@@ -226,8 +226,11 @@ func createDialTimeout(t time.Duration) func(network, addr string) (net.Conn, er
 	}
 }
 
-func redirectPolicy(_ *http.Request, _ []*http.Request) error {
-	return errors.New("redirect error")
+func redirectPolicy(_ *http.Request, via []*http.Request) (err error) {
+	if len(via) > 1 {
+		err = errors.New("redirect error")
+	}
+	return
 }
 
 // TCP接続
