@@ -13,13 +13,18 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
 type Balance struct {
 	Host string
 	Port int
+}
+
+type sesPacket struct {
+	key string
+	del bool
+	rch chan<- bool
 }
 
 type Config struct {
@@ -40,8 +45,7 @@ type SummaryHandle struct {
 	timeout time.Duration
 	f       func(network, addr string) (net.Conn, error)
 	lb      <-chan Balance
-	sesMux  sync.RWMutex
-	sesMap  map[string]bool
+	sesCh   chan<- sesPacket
 }
 
 const (
@@ -87,7 +91,7 @@ func main() {
 		timeout: t,
 		f:       createDialTimeout(t),
 		lb:      loadBalancing(c.BalanceList),
-		sesMap:  make(map[string]bool),
+		sesCh:   sesProc(),
 	}
 	server := &http.Server{
 		Addr:           fmt.Sprintf("%s:%d", c.Addr, c.Port),
@@ -98,6 +102,27 @@ func main() {
 	}
 	// サーバ起動
 	g_log.Fatal(server.ListenAndServe())
+}
+
+func sesProc() chan<- sesPacket {
+	reqch := make(chan sesPacket, 4)
+	go func(reqch <-chan sesPacket) {
+		m := make(map[string]bool)
+		for {
+			select {
+			case it := <-reqch:
+				if it.rch != nil {
+					_, ok := m[it.key]
+					it.rch <- ok
+				} else if it.del {
+					delete(m, it.key)
+				} else {
+					m[it.key] = true
+				}
+			}
+		}
+	}(reqch)
+	return reqch
 }
 
 func loadBalancing(bl []Balance) <-chan Balance {
@@ -162,25 +187,26 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sh *SummaryHandle) getSesMap(u string) bool {
-	sh.sesMux.RLock()
-	defer sh.sesMux.RUnlock()
-
-	_, ok := sh.sesMap[u]
-	return ok
+	ch := make(chan bool, 1)
+	defer close(ch)
+	sh.sesCh <- sesPacket{
+		key: u,
+		rch: ch,
+	}
+	return <-ch
 }
 
 func (sh *SummaryHandle) setSesMap(u string) {
-	sh.sesMux.Lock()
-	defer sh.sesMux.Unlock()
-
-	sh.sesMap[u] = true
+	sh.sesCh <- sesPacket{
+		key: u,
+	}
 }
 
 func (sh *SummaryHandle) delSesMap(u string) {
-	sh.sesMux.Lock()
-	defer sh.sesMux.Unlock()
-
-	delete(sh.sesMap, u)
+	sh.sesCh <- sesPacket{
+		key: u,
+		del: true,
+	}
 }
 
 func (sh *SummaryHandle) checkUrlWhiteList(u string) bool {
@@ -226,17 +252,26 @@ func createDialTimeout(t time.Duration) func(network, addr string) (net.Conn, er
 	}
 }
 
-func redirectPolicy(_ *http.Request, via []*http.Request) (err error) {
-	if len(via) > 1 {
-		err = errors.New("redirect error")
+type RedirectError struct {
+	host string
+	path string
+	msg string
+}
+func (e *RedirectError) Error() string {
+	return e.msg
+}
+
+func redirectPolicy(r *http.Request, _ []*http.Request) (err error) {
+	return &RedirectError{
+		host: r.URL.Host,
+		path: r.URL.Path,
+		msg: "redirect error",
 	}
-	return
 }
 
 // TCP接続
 func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
-	url := fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/"))
-	req, err := http.NewRequest(r.Method, url, nil)
+	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/")), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -246,7 +281,18 @@ func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, clie
 	req.Header.Set("Connection", "close")
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		if resp == nil {
+			return 0, err
+		}
+		uerr, ok := err.(*url.Error)
+		if !ok {
+			return 0, err
+		}
+		_, rok := uerr.Err.(*RedirectError)
+		if !rok {
+			return 0, err
+		}
+		// RedirectErrorならば処理継続
 	}
 	defer resp.Body.Close()
 
