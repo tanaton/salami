@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +38,7 @@ type Config struct {
 type SummaryHandle struct {
 	conf    *Config
 	timeout time.Duration
+	f       func(network, addr string) (net.Conn, error)
 	lb      <-chan Balance
 	sesMux  sync.RWMutex
 	sesMap  map[string]bool
@@ -81,9 +81,11 @@ func main() {
 	}
 	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
+	t := time.Duration(c.ProxyTimeoutSec) * time.Second
 	myHandler := &SummaryHandle{
 		conf:    c,
-		timeout: time.Duration(c.ProxyTimeoutSec) * time.Second,
+		timeout: t,
+		f:       createDialTimeout(t),
 		lb:      loadBalancing(c.BalanceList),
 		sesMap:  make(map[string]bool),
 	}
@@ -140,7 +142,15 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lbhost := <-sh.lb
 		sl := updatePathList(lbhost.Host, pl)
 		// この処理に時間がかかる
-		code, err := httpCopy(sl, lbhost.Port, w, r, sh.timeout)
+		code, err := httpCopy(sl, lbhost.Port, w, r, &http.Client{
+			Transport: &http.Transport{
+				Dial:                  sh.f,
+				DisableKeepAlives:     true,
+				DisableCompression:    true, // 圧縮解凍は全てこっちで指示する
+				ResponseHeaderTimeout: sh.timeout,
+			},
+			CheckRedirect: redirectPolicy,
+		})
 
 		if err == nil {
 			g_log.Printf("%d %s", code, u)
@@ -206,42 +216,44 @@ func gatewayTimeoutResponse(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusGatewayTimeout) // 504
 }
 
-// TCP接続
-func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, timeout time.Duration) (code int, err error) {
-	// 名前解決のタイムアウトを設定
-	if con, e := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", s[0], port), timeout); e == nil {
-		defer con.Close()
-		// 通信のタイムアウトを設定
-		con.SetDeadline(time.Now().Add(timeout))
-
-		// ヘッダー送信
-		fmt.Fprintf(con, "%s /%s %s"+CRLF_STR, r.Method, strings.Join(s[1:], "/"), r.Proto)
-		fmt.Fprintf(con, "Host: %s"+CRLF_STR, s[0])
-		r.Header.Write(con)
-		fmt.Fprintf(con, CRLF_STR)
-
-		// ヘッダー受信
-		if res, e := http.ReadResponse(bufio.NewReader(con), r); e == nil {
-			defer res.Body.Close()
-			code = res.StatusCode
-			// ヘッダーを書き込む
-			for key, _ := range res.Header {
-				w.Header().Set(key, res.Header.Get(key))
-			}
-			w.Header().Set("Connection", "close")
-			w.WriteHeader(code)
-			if code >= 200 && code < 300 {
-				// 本文を書き込む
-				io.Copy(w, res.Body)
-			}
-		} else {
-			err = e
+func createDialTimeout(t time.Duration) func(network, addr string) (net.Conn, error) {
+	return func(network, addr string) (net.Conn, error) {
+		con, err := net.DialTimeout(network, addr, t)
+		if err == nil {
+			con.SetDeadline(time.Now().Add(t))
 		}
-	} else {
-		// エラーをセット
-		err = e
+		return con, err
 	}
-	return
+}
+
+func redirectPolicy(_ *http.Request, _ []*http.Request) error {
+	return errors.New("redirect error")
+}
+
+// TCP接続
+func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
+	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/")), nil)
+	if err != nil {
+		return 0, err
+	}
+	for key, _ := range r.Header {
+		req.Header.Set(key, r.Header.Get(key))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	// ヘッダーを書き込む
+	for key, _ := range resp.Header {
+		w.Header().Set(key, resp.Header.Get(key))
+	}
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(resp.StatusCode)
+	// 本文を書き込む
+	io.Copy(w, resp.Body)
+	return resp.StatusCode, nil
 }
 
 func createPathList(u *url.URL) (pl []string, err error) {
