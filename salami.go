@@ -232,13 +232,15 @@ func redirectPolicy(_ *http.Request, _ []*http.Request) error {
 
 // TCP接続
 func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
-	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/")), nil)
+	url := fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/"))
+	req, err := http.NewRequest(r.Method, url, nil)
 	if err != nil {
 		return 0, err
 	}
 	for key, _ := range r.Header {
 		req.Header.Set(key, r.Header.Get(key))
 	}
+	req.Header.Set("Connection", "close")
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -266,10 +268,7 @@ func createPathList(u *url.URL) (pl []string, err error) {
 
 func updatePathList(host string, pl []string) (sl []string) {
 	if host != "" {
-		sl = []string{
-			host,
-		}
-		sl = append(sl, pl...)
+		sl = append([]string{host}, pl...)
 	} else {
 		sl = pl
 	}
