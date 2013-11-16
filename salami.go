@@ -90,7 +90,7 @@ func main() {
 	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
 	heartbeat := &http.Server{
-		Addr:           ":8080",
+		Addr:           ":80",
 		Handler:        &heartbeatHandle{text: "やっはろー"},
 		ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
 		WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
@@ -339,6 +339,7 @@ func updatePathList(host string, pl []string) (sl []string) {
 func (hbh *heartbeatHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// とりあえず全部正常
 	w.Write([]byte(hbh.text))
+	g_log.Println("Health Check OK")
 }
 
 func readConfig() *Config {
