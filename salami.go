@@ -48,6 +48,10 @@ type SummaryHandle struct {
 	sesCh   chan<- sesPacket
 }
 
+type heartbeatHandle struct {
+	text string
+}
+
 const (
 	CRLF_STR             = "\r\n"
 	LOAD_BALANCE_BUF     = 32
@@ -85,6 +89,15 @@ func main() {
 	}
 	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
+	heartbeat := &http.Server{
+		Addr:           ":8080",
+		Handler:        &heartbeatHandle{text: "やっはろー"},
+		ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
+		WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
+		MaxHeaderBytes: c.MaxHeaderBytes,
+	}
+	go heartbeat.ListenAndServe()
+
 	t := time.Duration(c.ProxyTimeoutSec) * time.Second
 	myHandler := &SummaryHandle{
 		conf:    c,
@@ -108,17 +121,14 @@ func sesProc() chan<- sesPacket {
 	reqch := make(chan sesPacket, 4)
 	go func(reqch <-chan sesPacket) {
 		m := make(map[string]bool)
-		for {
-			select {
-			case it := <-reqch:
-				if it.rch != nil {
-					_, ok := m[it.key]
-					it.rch <- ok
-				} else if it.del {
-					delete(m, it.key)
-				} else {
-					m[it.key] = true
-				}
+		for it := range reqch {
+			if it.rch != nil {
+				_, ok := m[it.key]
+				it.rch <- ok
+			} else if it.del {
+				delete(m, it.key)
+			} else {
+				m[it.key] = true
 			}
 		}
 	}(reqch)
@@ -127,14 +137,14 @@ func sesProc() chan<- sesPacket {
 
 func loadBalancing(bl []Balance) <-chan Balance {
 	ch := make(chan Balance, LOAD_BALANCE_BUF)
-	go func() {
+	go func(ch chan<- Balance) {
 		max := len(bl)
 		i := 0
 		for {
 			ch <- bl[i]
 			i = (i + 1) % max
 		}
-	}()
+	}(ch)
 	return ch
 }
 
@@ -186,14 +196,15 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (sh *SummaryHandle) getSesMap(u string) bool {
+func (sh *SummaryHandle) getSesMap(u string) (ret bool) {
 	ch := make(chan bool, 1)
-	defer close(ch)
 	sh.sesCh <- sesPacket{
 		key: u,
 		rch: ch,
 	}
-	return <-ch
+	ret = <-ch
+	close(ch)
+	return
 }
 
 func (sh *SummaryHandle) setSesMap(u string) {
@@ -255,8 +266,9 @@ func createDialTimeout(t time.Duration) func(network, addr string) (net.Conn, er
 type RedirectError struct {
 	host string
 	path string
-	msg string
+	msg  string
 }
+
 func (e *RedirectError) Error() string {
 	return e.msg
 }
@@ -265,7 +277,7 @@ func redirectPolicy(r *http.Request, _ []*http.Request) (err error) {
 	return &RedirectError{
 		host: r.URL.Host,
 		path: r.URL.Path,
-		msg: "redirect error",
+		msg:  "redirect error",
 	}
 }
 
@@ -322,6 +334,11 @@ func updatePathList(host string, pl []string) (sl []string) {
 		sl = pl
 	}
 	return
+}
+
+func (hbh *heartbeatHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// とりあえず全部正常
+	w.Write([]byte(hbh.text))
 }
 
 func readConfig() *Config {
