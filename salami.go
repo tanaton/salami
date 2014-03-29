@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -23,21 +22,22 @@ type Balance struct {
 
 type sesPacket struct {
 	key string
-	del bool
 	rch chan<- bool
 }
 
 type Config struct {
-	Addr            string
-	Port            int
-	ReadTimeoutSec  int
-	WriteTimeoutSec int
-	ProxyTimeoutSec int
-	MaxHeaderBytes  int
-	LogFilePath     string
-	URLWhiteList    []string
-	URLWhiteListReg []*regexp.Regexp `json:"-"`
-	BalanceList     []Balance
+	Addr             string
+	Port             int
+	ReadTimeoutSec   int
+	WriteTimeoutSec  int
+	ServerTimeoutSec int
+	ProxyTimeoutSec  int
+	MaxHeaderBytes   int
+	LogFilePath      string
+	URLWhiteList     []string
+	URLWhiteListReg  []*regexp.Regexp `json:"-"`
+	BalanceList      []Balance
+	Heartbeat        bool
 }
 
 type SummaryHandle struct {
@@ -53,25 +53,18 @@ type heartbeatHandle struct {
 }
 
 const (
-	CRLF_STR             = "\r\n"
-	LOAD_BALANCE_BUF     = 32
-	CONFIG_JSON_PATH_DEF = "salami.config.json"
-
-	ADDR_DEF              = ""
-	PORT_DEF              = 18080
-	READ_TIMEOUT_SEC_DEF  = 15
-	WRITE_TIMEOUT_SEC_DEF = 15
-	PROXY_TIMEOUT_SEC_DEF = 12
-	LOG_FILE_PATH_DEF     = ""
-	MAX_HEADER_BYTES_DEF  = 1024 * 10
+	LOAD_BALANCE_BUF       = 32
+	CONFIG_JSON_PATH_DEF   = "salami.config.json"
+	ADDR_DEF               = ""
+	PORT_DEF               = 18080
+	READ_TIMEOUT_SEC_DEF   = 15
+	WRITE_TIMEOUT_SEC_DEF  = 15
+	SERVER_TIMEOUT_SEC_DEF = 13
+	PROXY_TIMEOUT_SEC_DEF  = 12
+	LOG_FILE_PATH_DEF      = ""
+	MAX_HEADER_BYTES_DEF   = 1024 * 10
 )
 
-var g_balance_def = []Balance{
-	Balance{
-		Host: "",
-		Port: 80,
-	},
-}
 var g_log *log.Logger
 
 func main() {
@@ -84,19 +77,21 @@ func main() {
 		if err != nil {
 			log.Fatal("file open error")
 		}
-		//defer fp.Close()	実行終了で開放
 		w = fp
 	}
 	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
-	heartbeat := &http.Server{
-		Addr:           ":80",
-		Handler:        &heartbeatHandle{text: "やっはろー"},
-		ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
-		WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
-		MaxHeaderBytes: c.MaxHeaderBytes,
+	if c.Heartbeat {
+		// ハートビートを有効化
+		heartbeat := &http.Server{
+			Addr:           ":80",
+			Handler:        &heartbeatHandle{text: "やっはろー"},
+			ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
+			WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
+			MaxHeaderBytes: c.MaxHeaderBytes,
+		}
+		go heartbeat.ListenAndServe()
 	}
-	go heartbeat.ListenAndServe()
 
 	t := time.Duration(c.ProxyTimeoutSec) * time.Second
 	myHandler := &SummaryHandle{
@@ -108,7 +103,7 @@ func main() {
 	}
 	server := &http.Server{
 		Addr:           fmt.Sprintf("%s:%d", c.Addr, c.Port),
-		Handler:        myHandler,
+		Handler:        http.TimeoutHandler(myHandler, time.Duration(c.ServerTimeoutSec)*time.Second, "timeout!!!"),
 		ReadTimeout:    time.Duration(c.ReadTimeoutSec) * time.Second,
 		WriteTimeout:   time.Duration(c.WriteTimeoutSec) * time.Second,
 		MaxHeaderBytes: c.MaxHeaderBytes,
@@ -125,10 +120,9 @@ func sesProc() chan<- sesPacket {
 			if it.rch != nil {
 				_, ok := m[it.key]
 				it.rch <- ok
-			} else if it.del {
-				delete(m, it.key)
-			} else {
 				m[it.key] = true
+			} else {
+				delete(m, it.key)
 			}
 		}
 	}(reqch)
@@ -136,6 +130,9 @@ func sesProc() chan<- sesPacket {
 }
 
 func loadBalancing(bl []Balance) <-chan Balance {
+	if bl == nil {
+		return nil
+	}
 	ch := make(chan Balance, LOAD_BALANCE_BUF)
 	go func(ch chan<- Balance) {
 		max := len(bl)
@@ -149,35 +146,39 @@ func loadBalancing(bl []Balance) <-chan Balance {
 }
 
 func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	pl, err := createPathList(r.URL)
-	if err != nil {
+	u := strings.TrimLeft(r.URL.Path, "/")
+	pl := strings.Split(u, "/")
+	if len(pl) < 2 {
 		// 異常
 		badRequest(w)
-		g_log.Printf("Path error :%s", r.URL)
+		g_log.Printf("Message:Path error\tPath:%s", u)
 		return
 	}
-	u := "http://" + strings.Join(pl, "/")
-
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
 		badRequest(w)
-		g_log.Printf("WhiteList error :%s", u)
+		g_log.Printf("Message:WhiteList error\tPath:%s", u)
 		return
 	}
 
-	if ok := sh.getSesMap(u); ok {
+	if sh.lockSession(u) {
 		// 衝突
 		conflictResponse(w)
-		g_log.Printf("Conflict %s", u)
+		g_log.Printf("Message:Conflict\tPath:%s", u)
 	} else {
 		// 1度目のアクセス
-		sh.setSesMap(u)
-		defer sh.delSesMap(u)
-
-		lbhost := <-sh.lb
-		sl := updatePathList(lbhost.Host, pl)
+		// バランスする
+		var lbhost Balance
+		if sh.lb != nil {
+			lbhost = <-sh.lb
+		} else {
+			lbhost = Balance{
+				Host: "",
+				Port: 80,
+			}
+		}
 		// この処理に時間がかかる
-		code, err := httpCopy(sl, lbhost.Port, w, r, &http.Client{
+		code, err := httpCopy(pl, lbhost, w, r, &http.Client{
 			Transport: &http.Transport{
 				Dial:                  sh.f,
 				DisableKeepAlives:     true,
@@ -188,15 +189,18 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if err == nil {
-			g_log.Printf("%d %s", code, u)
+			g_log.Printf("Host:%s\tPort:%d\tCode:%d\tPath:%s", lbhost.Host, lbhost.Port, code, u)
 		} else {
 			gatewayTimeoutResponse(w)
-			g_log.Printf("Bad Response => Host:%s Port:%d URL:%s", lbhost.Host, lbhost.Port, u)
+			g_log.Printf("Message:Bad Response\tHost:%s\tPort:%d\tError:%s\tPath:%s", lbhost.Host, lbhost.Port, u, err.Error())
 		}
+
+		// セッションの解除
+		sh.unlockSession(u)
 	}
 }
 
-func (sh *SummaryHandle) getSesMap(u string) (ret bool) {
+func (sh *SummaryHandle) lockSession(u string) (ret bool) {
 	ch := make(chan bool, 1)
 	sh.sesCh <- sesPacket{
 		key: u,
@@ -207,16 +211,9 @@ func (sh *SummaryHandle) getSesMap(u string) (ret bool) {
 	return
 }
 
-func (sh *SummaryHandle) setSesMap(u string) {
+func (sh *SummaryHandle) unlockSession(u string) {
 	sh.sesCh <- sesPacket{
 		key: u,
-	}
-}
-
-func (sh *SummaryHandle) delSesMap(u string) {
-	sh.sesCh <- sesPacket{
-		key: u,
-		del: true,
 	}
 }
 
@@ -282,8 +279,12 @@ func redirectPolicy(r *http.Request, _ []*http.Request) (err error) {
 }
 
 // TCP接続
-func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
-	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", s[0], port, strings.Join(s[1:], "/")), nil)
+func httpCopy(s []string, lbhost Balance, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
+	if lbhost.Host == "" {
+		lbhost.Host = s[0]
+		s = s[1:]
+	}
+	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", lbhost.Host, lbhost.Port, strings.Join(s, "/")), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -306,8 +307,6 @@ func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, clie
 		}
 		// RedirectErrorならば処理継続
 	}
-	defer resp.Body.Close()
-
 	// ヘッダーを書き込む
 	for key, _ := range resp.Header {
 		w.Header().Set(key, resp.Header.Get(key))
@@ -316,30 +315,15 @@ func httpCopy(s []string, port int, w http.ResponseWriter, r *http.Request, clie
 	w.WriteHeader(resp.StatusCode)
 	// 本文を書き込む
 	io.Copy(w, resp.Body)
+	// クローズする
+	resp.Body.Close()
 	return resp.StatusCode, nil
-}
-
-func createPathList(u *url.URL) (pl []string, err error) {
-	pl = strings.Split(strings.TrimLeft(u.Path, "/"), "/")
-	if len(pl) < 2 {
-		err = errors.New("Invalid request")
-	}
-	return
-}
-
-func updatePathList(host string, pl []string) (sl []string) {
-	if host != "" {
-		sl = append([]string{host}, pl...)
-	} else {
-		sl = pl
-	}
-	return
 }
 
 func (hbh *heartbeatHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// とりあえず全部正常
 	w.Write([]byte(hbh.text))
-	g_log.Println("Health Check OK")
+	g_log.Println("Message:Health Check OK")
 }
 
 func readConfig() *Config {
@@ -351,9 +335,10 @@ func readConfig() *Config {
 	} else {
 		path = CONFIG_JSON_PATH_DEF
 	}
+	c.readDefault()
 	err := c.readConfig(path)
 	if err != nil {
-		c.readDefault()
+		panic(err)
 	}
 	return c
 }
@@ -368,13 +353,11 @@ func (c *Config) readConfig(filename string) error {
 		return err
 	}
 
-	if len(c.BalanceList) == 0 {
-		c.BalanceList = g_balance_def
-	}
-	if len(c.URLWhiteList) > 0 {
-		c.URLWhiteListReg = []*regexp.Regexp{}
-		for _, it := range c.URLWhiteList {
-			c.URLWhiteListReg = append(c.URLWhiteListReg, regexp.MustCompile(it))
+	l := len(c.URLWhiteList)
+	if l > 0 {
+		c.URLWhiteListReg = make([]*regexp.Regexp, l)
+		for i, it := range c.URLWhiteList {
+			c.URLWhiteListReg[i] = regexp.MustCompile(it)
 		}
 	} else {
 		c.URLWhiteListReg = nil
@@ -387,9 +370,11 @@ func (c *Config) readDefault() {
 	c.Port = PORT_DEF
 	c.ReadTimeoutSec = READ_TIMEOUT_SEC_DEF
 	c.WriteTimeoutSec = WRITE_TIMEOUT_SEC_DEF
+	c.ServerTimeoutSec = SERVER_TIMEOUT_SEC_DEF
 	c.ProxyTimeoutSec = PROXY_TIMEOUT_SEC_DEF
 	c.MaxHeaderBytes = MAX_HEADER_BYTES_DEF
 	c.LogFilePath = LOG_FILE_PATH_DEF
 	c.URLWhiteListReg = nil
-	c.BalanceList = g_balance_def
+	c.BalanceList = nil
+	c.Heartbeat = false
 }
