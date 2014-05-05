@@ -156,7 +156,8 @@ func cacheIP(timeout, deadline time.Duration) chan<- ipPacket {
 				if !ok {
 					iplist, err := lookupIPDeadline(it.host, deadline)
 					if err == nil {
-						m[it.host] = iplist[0].String()
+						ip = iplist[0].String()
+						m[it.host] = ip
 					}
 				}
 				it.rch <- ip
