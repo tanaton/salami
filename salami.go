@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -25,6 +26,11 @@ type sesPacket struct {
 	rch chan<- bool
 }
 
+type ipPacket struct {
+	host string
+	rch  chan<- string
+}
+
 type Config struct {
 	Addr             string
 	Port             int
@@ -38,6 +44,7 @@ type Config struct {
 	URLWhiteListReg  []*regexp.Regexp `json:"-"`
 	BalanceList      []Balance
 	Heartbeat        bool
+	IPCacheTimeSec   int
 }
 
 type SummaryHandle struct {
@@ -46,6 +53,7 @@ type SummaryHandle struct {
 	f       func(network, addr string) (net.Conn, error)
 	lb      <-chan Balance
 	sesCh   chan<- sesPacket
+	ipCh    chan<- ipPacket
 }
 
 type heartbeatHandle struct {
@@ -100,6 +108,7 @@ func main() {
 		f:       createDialTimeout(t),
 		lb:      loadBalancing(c.BalanceList),
 		sesCh:   sesProc(),
+		ipCh:    cacheIP(time.Duration(c.IPCacheTimeSec)*time.Second, t),
 	}
 	server := &http.Server{
 		Addr:           fmt.Sprintf("%s:%d", c.Addr, c.Port),
@@ -115,18 +124,46 @@ func main() {
 func sesProc() chan<- sesPacket {
 	reqch := make(chan sesPacket, 4)
 	go func(reqch <-chan sesPacket) {
-		m := make(map[string]bool)
+		m := make(map[string]struct{})
 		for it := range reqch {
 			if it.rch != nil {
 				_, ok := m[it.key]
 				it.rch <- ok
-				m[it.key] = true
+				m[it.key] = struct{}{}
 			} else {
 				delete(m, it.key)
 			}
 		}
 	}(reqch)
 	return reqch
+}
+
+func cacheIP(timeout, deadline time.Duration) chan<- ipPacket {
+	if timeout <= 0 {
+		return nil
+	}
+	reqc := make(chan ipPacket, 4)
+	go func() {
+		delc := time.Tick(timeout)
+		m := make(map[string]string, 32)
+		for {
+			select {
+			case <-delc:
+				// 定期的に削除
+				m = make(map[string]string, 32)
+			case it := <-reqc:
+				ip, ok := m[it.host]
+				if !ok {
+					iplist, err := lookupIPDeadline(it.host, deadline)
+					if err == nil {
+						m[it.host] = iplist[0].String()
+					}
+				}
+				it.rch <- ip
+			}
+		}
+	}()
+	return reqc
 }
 
 func loadBalancing(bl []Balance) <-chan Balance {
@@ -178,15 +215,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// この処理に時間がかかる
-		code, err := httpCopy(pl, lbhost, w, r, &http.Client{
-			Transport: &http.Transport{
-				Dial:                  sh.f,
-				DisableKeepAlives:     true,
-				DisableCompression:    true, // 圧縮解凍は全てこっちで指示する
-				ResponseHeaderTimeout: sh.timeout,
-			},
-			CheckRedirect: redirectPolicy,
-		})
+		code, err := sh.httpCopy(pl, lbhost, w, r)
 
 		if err == nil {
 			g_log.Printf("Host:%s\tPort:%d\tCode:%d\tPath:%s", lbhost.Host, lbhost.Port, code, u)
@@ -279,7 +308,7 @@ func redirectPolicy(r *http.Request, _ []*http.Request) (err error) {
 }
 
 // TCP接続
-func httpCopy(s []string, lbhost Balance, w http.ResponseWriter, r *http.Request, client *http.Client) (int, error) {
+func (sh *SummaryHandle) httpCopy(s []string, lbhost Balance, w http.ResponseWriter, r *http.Request) (int, error) {
 	if lbhost.Host == "" {
 		lbhost.Host = s[0]
 		s = s[1:]
@@ -288,10 +317,28 @@ func httpCopy(s []string, lbhost Balance, w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return 0, err
 	}
+	if sh.ipCh != nil && net.ParseIP(lbhost.Host) == nil {
+		// IP cache有効、かつIPではなくホスト名でリクエストを受けた場合
+		ch := make(chan string, 1)
+		sh.ipCh <- ipPacket{lbhost.Host, ch}
+		ip := <-ch
+		close(ch)
+		req.Host = req.URL.Host
+		req.URL.Host = fmt.Sprintf("%s:%d", ip, lbhost.Port)
+	}
 	for key, _ := range r.Header {
 		req.Header.Set(key, r.Header.Get(key))
 	}
 	req.Header.Set("Connection", "close")
+	client := &http.Client{
+		Transport: &http.Transport{
+			Dial:                  sh.f,
+			DisableKeepAlives:     true,
+			DisableCompression:    true, // 圧縮解凍は全てこっちで指示する
+			ResponseHeaderTimeout: sh.timeout,
+		},
+		CheckRedirect: redirectPolicy,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if resp == nil {
@@ -324,6 +371,31 @@ func (hbh *heartbeatHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// とりあえず全部正常
 	w.Write([]byte(hbh.text))
 	g_log.Println("Message:Health Check OK")
+}
+
+// src/pkg/net/lookup.goを参考に作成
+func lookupIPDeadline(host string, deadline time.Duration) (addrs []net.IP, err error) {
+	if deadline <= 0 {
+		return net.LookupIP(host)
+	}
+	t := time.NewTimer(deadline)
+	defer t.Stop()
+	type res struct {
+		addrs []net.IP
+		err   error
+	}
+	resc := make(chan res, 1)
+	go func() {
+		a, err := net.LookupIP(host)
+		resc <- res{a, err}
+	}()
+	select {
+	case <-t.C:
+		err = errors.New("ホストの名前解決がタイムアウトしました")
+	case r := <-resc:
+		addrs, err = r.addrs, r.err
+	}
+	return
 }
 
 func readConfig() *Config {
@@ -377,4 +449,5 @@ func (c *Config) readDefault() {
 	c.URLWhiteListReg = nil
 	c.BalanceList = nil
 	c.Heartbeat = false
+	c.IPCacheTimeSec = 0
 }
