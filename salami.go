@@ -324,8 +324,10 @@ func (sh *SummaryHandle) httpCopy(s []string, lbhost Balance, w http.ResponseWri
 		sh.ipCh <- ipPacket{lbhost.Host, ch}
 		ip := <-ch
 		close(ch)
-		req.Host = req.URL.Host
-		req.URL.Host = fmt.Sprintf("%s:%d", ip, lbhost.Port)
+		if ip != "" {
+			req.Host = req.URL.Host
+			req.URL.Host = fmt.Sprintf("%s:%d", ip, lbhost.Port)
+		}
 	}
 	for key, _ := range r.Header {
 		req.Header.Set(key, r.Header.Get(key))
