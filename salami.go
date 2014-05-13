@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -73,7 +72,7 @@ const (
 	MAX_HEADER_BYTES_DEF   = 1024 * 10
 )
 
-var g_log *log.Logger
+var g_log chan<- string
 
 func main() {
 	c := readConfig()
@@ -83,11 +82,11 @@ func main() {
 	} else {
 		fp, err := os.OpenFile(c.LogFilePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 		if err != nil {
-			log.Fatal("file open error")
+			panic("file open error")
 		}
 		w = fp
 	}
-	g_log = log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+	g_log = loggerProc(w, 16)
 
 	if c.Heartbeat {
 		// ハートビートを有効化
@@ -118,7 +117,26 @@ func main() {
 		MaxHeaderBytes: c.MaxHeaderBytes,
 	}
 	// サーバ起動
-	g_log.Fatal(server.ListenAndServe())
+	server.ListenAndServe()
+}
+
+func loggerProc(w io.Writer, bsize int) chan<- string {
+	if bsize <= 0 {
+		bsize = 1
+	}
+	c := make(chan string, bsize)
+	go writeLogProc(c, w)
+	return c
+}
+
+func writeLogProc(c <-chan string, w io.Writer) {
+	for s := range c {
+		if len(s) > 0 && s[len(s)-1] != '\n' {
+			s += "\n"
+		}
+		date := time.Now().Format("02/Jan/2006:15:04:05 -0700")
+		io.WriteString(w, "Date:" + date + "\t" + s)
+	}
 }
 
 func sesProc() chan<- sesPacket {
@@ -189,20 +207,20 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(pl) < 2 {
 		// 異常
 		badRequest(w)
-		g_log.Printf("Message:Path error\tPath:%s", u)
+		g_log <- fmt.Sprintf("Message:Path error\tPath:%s", u)
 		return
 	}
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
 		badRequest(w)
-		g_log.Printf("Message:WhiteList error\tPath:%s", u)
+		g_log <- fmt.Sprintf("Message:WhiteList error\tPath:%s", u)
 		return
 	}
 
 	if sh.lockSession(u) {
 		// 衝突
 		conflictResponse(w)
-		g_log.Printf("Message:Conflict\tPath:%s", u)
+		g_log <- fmt.Sprintf("Message:Conflict\tPath:%s", u)
 	} else {
 		// 1度目のアクセス
 		// バランスする
@@ -219,10 +237,10 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		code, err := sh.httpCopy(pl, lbhost, w, r)
 
 		if err == nil {
-			g_log.Printf("Host:%s\tPort:%d\tCode:%d\tPath:%s", lbhost.Host, lbhost.Port, code, u)
+			g_log <- fmt.Sprintf("Host:%s\tPort:%d\tCode:%d\tPath:%s", lbhost.Host, lbhost.Port, code, u)
 		} else {
 			gatewayTimeoutResponse(w)
-			g_log.Printf("Message:Bad Response\tHost:%s\tPort:%d\tError:%s\tPath:%s", lbhost.Host, lbhost.Port, u, err.Error())
+			g_log <- fmt.Sprintf("Message:Bad Response\tHost:%s\tPort:%d\tError:%s\tPath:%s", lbhost.Host, lbhost.Port, u, err.Error())
 		}
 
 		// セッションの解除
@@ -373,7 +391,7 @@ func (sh *SummaryHandle) httpCopy(s []string, lbhost Balance, w http.ResponseWri
 func (hbh *heartbeatHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// とりあえず全部正常
 	w.Write([]byte(hbh.text))
-	g_log.Println("Message:Health Check OK")
+	g_log <- fmt.Sprintf("Message:Health Check OK")
 }
 
 // src/pkg/net/lookup.goを参考に作成
