@@ -203,12 +203,14 @@ func loadBalancing(bl []Balance) <-chan Balance {
 
 func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u := strings.TrimLeft(r.URL.Path, "/")
-	pl := strings.Split(u, "/")
-	if len(pl) < 2 {
+	if strings.Index(u, "/") < 0 {
 		// 異常
 		badRequest(w)
 		g_log <- fmt.Sprintf("Message:Path error\tPath:%s", u)
 		return
+	}
+	if r.URL.RawQuery != "" {
+		u += "?" + r.URL.RawQuery
 	}
 	// ホワイトリストの確認
 	if sh.checkUrlWhiteList(u) == false {
@@ -234,7 +236,7 @@ func (sh *SummaryHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// この処理に時間がかかる
-		code, err := sh.httpCopy(pl, lbhost, w, r)
+		code, err := sh.httpCopy(u, lbhost, w, r)
 
 		if err == nil {
 			g_log <- fmt.Sprintf("Host:%s\tPort:%d\tCode:%d\tPath:%s", lbhost.Host, lbhost.Port, code, u)
@@ -327,12 +329,15 @@ func redirectPolicy(r *http.Request, _ []*http.Request) (err error) {
 }
 
 // TCP接続
-func (sh *SummaryHandle) httpCopy(s []string, lbhost Balance, w http.ResponseWriter, r *http.Request) (int, error) {
+func (sh *SummaryHandle) httpCopy(u string, lbhost Balance, w http.ResponseWriter, r *http.Request) (int, error) {
 	if lbhost.Host == "" {
-		lbhost.Host = s[0]
-		s = s[1:]
+		i := strings.Index(u, "/")
+		if i >= 0 {
+			lbhost.Host = u[:i]
+			u = u[i+1:]
+		}
 	}
-	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", lbhost.Host, lbhost.Port, strings.Join(s, "/")), nil)
+	req, err := http.NewRequest(r.Method, fmt.Sprintf("http://%s:%d/%s", lbhost.Host, lbhost.Port, u), nil)
 	if err != nil {
 		return 0, err
 	}
